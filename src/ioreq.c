@@ -79,10 +79,12 @@ void ioreq_send(int socket, const void *buf, size_t len, void *data, ioreq_cb cb
 	io_uring_submit(uring);
 }
 
-int ioreq_handle_event(struct io_uring_cqe *cqe)
+void ioreq_handle_cqe(struct io_uring_cqe *cqe)
 {
 	struct ioreq *r = (struct ioreq *)cqe->user_data;
-	r->callback(cqe->res, r->socket, r->user_data);
+	if (r->callback) {
+		r->callback(cqe->res, r->socket, r->user_data);
+	}
 	free(r);
 }
 

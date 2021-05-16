@@ -23,8 +23,8 @@
 #define OP_STATE_PUSH		3
 #define OP_GAME_END		4
 
-struct io_uring *uring;
 
+// struct definitions
 struct room {
 	char code[5];
 	int socket[2];
@@ -32,20 +32,15 @@ struct room {
 };
 
 struct server {
-	int socket;
-	struct io_uring ring;
 	tz_table *rooms;
 };
 
-struct req_context {
-	int socket;
-	int free_iov;
-	int event_type;
+struct start_game_msg {
+	char *buffer;
 	struct room *room;
-	int iov_len;
-	struct iovec iov[];
 };
 
+// function definitions
 int get_listener(int port)
 {
 	int sock;
@@ -75,65 +70,32 @@ int get_listener(int port)
 	return sock;
 }
 
-void add_accept_req(
-	struct io_uring *ring,
-	int listener,
-	struct sockaddr_in *client_addr,
-	socklen_t *addr_sz)
-{
-	struct sockaddr *addr = (struct sockaddr *)client_addr;
-
-	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-	io_uring_prep_accept(sqe, listener, addr, addr_sz, 0);
-
-	struct req_context *context = malloc(sizeof(*context));
-	context->event_type = EVENT_TYPE_ACCEPT;
-	io_uring_sqe_set_data(sqe, context);
-}
-
-void add_read_req(struct io_uring *ring, int socket, int event_type)
-{
-	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-	struct req_context *ctx = malloc(sizeof(*ctx) + sizeof(struct iovec));
-	memset(ctx, 0, sizeof(*ctx));
-
-	ctx->free_iov = 1;
-	ctx->socket = socket;
-	ctx->event_type = event_type;
-	ctx->iov[0].iov_len = READ_SZ;
-	ctx->iov[0].iov_base = malloc(READ_SZ);
-	io_uring_prep_readv(sqe, socket, &ctx->iov[0], 1, 0);
-	io_uring_sqe_set_data(sqe, ctx);
-}
-
-void add_write_req(struct io_uring *ring, struct req_context *ctx)
-{
-	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-	io_uring_prep_writev(sqe, ctx->socket, ctx->iov, ctx->iov_len, 0);
-	io_uring_sqe_set_data(sqe, ctx);
-}
-
-struct room *room_init(struct server *s)
+struct room *server_room_init(struct server *s)
 {
 	struct room *r = malloc(sizeof(*r));
+	if (!r) die("server_room_init(): malloc():");
 	memset(r, 0, sizeof(*r));
+
 	do for (int i = 0; i < 4; i++) {
 		r->code[i] = random_int(9) + '0';
 	} while (!tz_table_store(s->rooms, r->code, r));
-	printf("created room %s\n", r->code);
+
+	fprintf(stdout, "created room %s\n", r->code);
+	
 	return r;
 }
 
-void room_add_conn(struct room *r, int position, int socket)
+struct room *server_get_room(struct server *s, const char *code)
 {
-	r->socket[position] = socket;
+	return tz_table_fetch(s->rooms, code);
 }
 
-void room_free(void *data)
+void server_room_free(struct server *s, const char *code)
 {
-	struct connection *c;
-	struct room *r = (struct room *)data;
-	printf("freeing room %s!\n", r->code);
+	struct room *r = tz_table_rm(s->rooms, code);
+	if (!r) return;
+
+	printf("freeing room %s!\n", code);
 
 	for (int i = 0; i < 2; i++) {
 		if (r->socket[i]) close(r->socket[i]);
@@ -142,167 +104,87 @@ void room_free(void *data)
 	free(r);
 }
 
-void handle_conn(struct server *s, struct req_context *ctx)
-{
-	struct room *room;
-	struct req_context *wctx;
-	char *buffer = ctx->iov[0].iov_base;
 
-	buffer[0] = buffer[0] - '0';
+int room_add_conn(struct room *r, int socket)
+{
+	for (int i = 0; i < 2; i++) {
+		if (r->socket[i]) continue;
+		r->socket[i] = socket;
+		return i;
+	}
+	return -1;
+}
+
+// global variables
+struct io_uring *uring;		// used in ioreq
+static struct server *server;	// used in our callbacks
+
+// callbacks
+
+void start_game(int rv, int socket, void *data)
+{
+	printf("we made it!\n");
+	struct start_game_msg *msg = data;
+	free(msg->buffer);
+	server_room_free(server, msg->room->code);
+}
+
+void handle_first_recv(int rv, int socket, void *data)
+{
+	if (rv == 0) {
+		fprintf(stderr, "closed!\n");
+		close(socket);
+		return;
+	}
+
+	struct room *room;
+	struct start_game_msg *msg;
+
+	char *buffer = data;
+	if (buffer[0] >= '0') buffer[0] -= '0';
 
 	switch (buffer[0]) {
 	case OP_CREATE_ROOM:
-		room = room_init(s);
-		room_add_conn(room, 0, ctx->socket);
-
-		wctx = malloc(sizeof(*wctx) + sizeof(struct iovec));
-		memset(wctx, 0, sizeof(*wctx));
-		wctx->event_type = EVENT_TYPE_WRITE_INIT;
-		wctx->socket = ctx->socket;
-		wctx->room = room;
-
-		wctx->iov[0].iov_base = room->code;
-		wctx->iov[0].iov_len = 5;
-		wctx->iov_len = 1;
-
-		add_write_req(&s->ring, wctx);
+		room = server_room_init(server);
+		room_add_conn(room, socket);
+		ioreq_send(socket, room->code, 5, NULL, NULL);
 		break;
 	case OP_JOIN_ROOM:
 		buffer += 1;
 		buffer[4] = '\0';
-		printf("fetching %s\n", buffer);
-		room = tz_table_fetch(s->rooms, buffer);
-		if (!room || room->socket[1]) {
+		room = server_get_room(server, buffer);
+		if (!room || room_add_conn(room, socket) < 0) {
 			fprintf(stderr, "bad room join: %s\n", buffer);
-			wctx = malloc(sizeof(*wctx) + sizeof(struct iovec));
-			wctx->event_type = EVENT_TYPE_WRITE_BADJOIN;
-			wctx->socket = ctx->socket;
-
-			wctx->free_iov = 1;
-			wctx->iov[0].iov_base = malloc(sizeof(char) * 3);
-			memcpy(wctx->iov[0].iov_base, "-1", 3);
-			wctx->iov[0].iov_len = 3;
-			wctx->iov_len = 1;
-
-			add_write_req(&s->ring, wctx);
 			break;
 		}
+		fprintf(stdout, "joining %s\n", buffer);
 
-		room_add_conn(room, 1, ctx->socket);
-		wctx = malloc(sizeof(*wctx) + sizeof(struct iovec));
-		wctx->event_type = EVENT_TYPE_WRITE_JOIN;
-		wctx->socket = ctx->socket;
-		wctx->room = room;
+		msg = malloc(sizeof(*msg));
+		if (!msg) die("handle_first_recv(): malloc():");
+		memset(msg, 0, sizeof(*msg));
 
-		wctx->free_iov = 1;
-		wctx->iov[0].iov_base = malloc(sizeof(char) * 2);
-		memcpy(wctx->iov[0].iov_base, "2", 2);
-		wctx->iov[0].iov_len = 2;
-		wctx->iov_len = 1;
+		msg->buffer = malloc(sizeof(char) * 3);
+		if (!msg->buffer) die("handle_first_recv(): malloc():");
+		memcpy(msg->buffer, "2\n", 3);
 
-		add_write_req(&s->ring, wctx);
+		ioreq_send(socket, msg->buffer, 3, msg, start_game);
 		break;
-	/*
-	case OP_GAME_START:
-		break;
-	case OP_STATE_PUSH:
-		break;
-	case OP_GAME_END:
-		break;
-	*/
 	default:
-		fprintf(stderr, "handle_conn(): bad op: %d\n", buffer[0]);
-		close(ctx->socket);
+		fprintf(stderr, "bad op: %i\n", buffer[0]);
+		close(socket);
 	}
+	free(data);
 }
 
-void handle_io_event(
-	struct server *s,
-	struct io_uring_cqe *cqe,
-	struct sockaddr_in *client_addr,
-	socklen_t *addr_sz)
+void handle_accept(int client_socket, int socket, void *data)
 {
-	struct room *room;
-	struct req_context *wctx;
-	struct req_context *context = (struct req_context *)cqe->user_data;
-	if (cqe->res < 0) {
-		die("handle_io_event(): event type %d:", context->event_type);
-	}
+	ioreq_accept(socket, NULL, handle_accept);
 
-	switch (context->event_type) {
-	case EVENT_TYPE_ACCEPT:
-		add_accept_req(
-			&s->ring, 
-			s->socket, 
-			client_addr, 
-			addr_sz);
-		add_read_req(
-			&s->ring, 
-			cqe->res, 
-			EVENT_TYPE_READ_INIT);
-		break;
-	case EVENT_TYPE_READ_INIT:
-		if (!cqe->res) {
-			close(context->socket);
-			break;
-		}
-		handle_conn(s, context);
-		break;
-	case EVENT_TYPE_WRITE_INIT:
-		break;
-	case EVENT_TYPE_WRITE_BADJOIN:
-		close(context->socket);
-		break;
-	case EVENT_TYPE_WRITE_JOIN:
-		room = context->room;
-		wctx = malloc(sizeof(*wctx) + sizeof(struct iovec));
-		memset(wctx, 0, sizeof(*wctx));
-		wctx->event_type = EVENT_TYPE_WRITE_GAMESTART;
+	char *buffer = malloc(sizeof(char) * (READ_SZ + 1));
+	if (!buffer) die("handle_accept(): malloc():");
+	memset(buffer, 0, sizeof(char) * (READ_SZ + 1));
 
-		wctx->free_iov = 1;
-		wctx->iov[0].iov_base = malloc(sizeof(char) * 11);
-		memcpy(wctx->iov[0].iov_base, "gamestart\n", 11);
-		wctx->iov[0].iov_len = 11;
-		wctx->iov_len = 1;
-
-		wctx->socket = room->socket[0];
-		add_write_req(&s->ring, wctx);
-
-		wctx->socket = room->socket[1];
-		add_write_req(&s->ring, wctx);
-		break;
-	}
-
-	if (context->free_iov) {
-		for (int i = 0; i < context->iov_len; i++) {
-			free(context->iov[i].iov_base);
-		}
-	}
-	if (context) free(context);
-	io_uring_cqe_seen(&s->ring, cqe);
-}
-
-void server_loop(struct server *s)
-{
-	int status;
-	struct io_uring_cqe *cqe;
-	//struct __kernel_timespec timeout;
-	struct sockaddr_in client_addr;
-	socklen_t addr_sz = sizeof(client_addr);
-
-	//memset(&timeout, 0, sizeof(timeout));
-	//timeout.tv_nsec = 10;
-
-	add_accept_req(&s->ring, s->socket, &client_addr, &addr_sz);
-
-	while (1) {
-		io_uring_submit(&s->ring);
-		status = io_uring_wait_cqe(&s->ring, &cqe);
-		if (status < 0) {
-			die("accept_loop(): io_uring_wait_cqe():");
-		}
-		handle_io_event(s, cqe, &client_addr, &addr_sz);
-	}
+	ioreq_recv(client_socket, buffer, READ_SZ, buffer, handle_first_recv);
 }
 
 int main(int argc, char **argv)
@@ -310,17 +192,27 @@ int main(int argc, char **argv)
 	srand(time(NULL));
 
 	struct io_uring ring;
+	struct io_uring_cqe *cqe;
 	io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
 	uring = &ring;
 
-	struct server s;
-	s.rooms = tz_table_init(NULL, NULL);
+	struct server _server;
+	_server.rooms = tz_table_init(NULL, NULL);
+	server = &_server;
 
-	s.socket = get_listener(DF_PORT);
-	printf("listening on %d\n", DF_PORT);
-	close(s.socket);
+	int socket = get_listener(DF_PORT);
+	fprintf(stdout, "listening on :%d\n", DF_PORT);
 
-	tz_table_free(s.rooms);
+	ioreq_accept(socket, NULL, handle_accept);
+	while (1) {
+		int status = io_uring_wait_cqe(&ring, &cqe);
+		if (status < 0) die("main(): io_uring_wait_cqe():");
+		ioreq_handle_cqe(cqe);
+		io_uring_cqe_seen(&ring, cqe);
+	}
+
+	close(socket);
+	tz_table_free(_server.rooms);
 	io_uring_queue_exit(&ring);
 
 	return 0;

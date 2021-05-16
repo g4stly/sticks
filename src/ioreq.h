@@ -9,6 +9,6 @@ void ioreq_accept(int socket, void *data, ioreq_cb cb);
 void ioreq_recv(int socket, void *buf, size_t len, void *data, ioreq_cb cb);
 void ioreq_send(int socket, const void *buf, size_t len, void *data, ioreq_cb cb);
 
-int ioreq_handle_cqe(struct io_uring_cqe *cqe);
+void ioreq_handle_cqe(struct io_uring_cqe *cqe);
 
 #endif
