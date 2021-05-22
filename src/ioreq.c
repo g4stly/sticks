@@ -72,6 +72,7 @@ void ioreq_send(int socket, const void *buf, size_t len, void *data, ioreq_cb cb
 
 	r->ioreq_type = IOREQ_TYPE_SEND;
 	r->user_data = data;
+	r->socket = socket;
 	r->callback = cb;
 
 	io_uring_prep_send(sqe, socket, buf, len, 0);

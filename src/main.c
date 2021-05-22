@@ -19,25 +19,36 @@
 
 #define OP_CREATE_ROOM 		0
 #define OP_JOIN_ROOM		1
-#define OP_GAME_START		2
-#define OP_STATE_PUSH		3
+#define OP_GAME_START		'2'
+#define OP_STATE_PUSH		'3'
 #define OP_GAME_END		4
+
+#define ROOM_STATE_PENDING	0
+#define ROOM_STATE_PLAYING	1
+#define ROOM_STATE_STOPPED	2
+#define ROOM_STATE_BROKEN	3
 
 
 // struct definitions
 struct room {
-	char code[5];
 	int socket[2];
-	int game[4];
+	char code[5];
+	char wbuffer[READ_SZ + 1];
+	char rbuffer0[READ_SZ + 1];
+	char rbuffer1[READ_SZ + 1];
+	char game[4];
+	int state;
+	int turn;
 };
 
 struct server {
 	tz_table *rooms;
 };
 
-struct start_game_msg {
-	char *buffer;
-	struct room *room;
+struct wait_all {
+	int count;
+	void *user_data;
+	ioreq_cb callback;
 };
 
 // function definitions
@@ -75,6 +86,8 @@ struct room *server_room_init(struct server *s)
 	struct room *r = malloc(sizeof(*r));
 	if (!r) die("server_room_init(): malloc():");
 	memset(r, 0, sizeof(*r));
+	memset(r->game, 1, 4);
+
 
 	do for (int i = 0; i < 4; i++) {
 		r->code[i] = random_int(9) + '0';
@@ -92,15 +105,9 @@ struct room *server_get_room(struct server *s, const char *code)
 
 void server_room_free(struct server *s, const char *code)
 {
+	printf("freeing room %s!\n", code);
 	struct room *r = tz_table_rm(s->rooms, code);
 	if (!r) return;
-
-	printf("freeing room %s!\n", code);
-
-	for (int i = 0; i < 2; i++) {
-		if (r->socket[i]) close(r->socket[i]);
-	}
-
 	free(r);
 }
 
@@ -115,31 +122,156 @@ int room_add_conn(struct room *r, int socket)
 	return -1;
 }
 
+void pack_state(char *buffer, char active, char passive, char *game, int flip)
+{
+	buffer[0] = OP_STATE_PUSH;
+	buffer[1] = active;
+	buffer[2] = passive;
+	buffer[3] = game[flip ? 2 : 0] + '0';
+	buffer[4] = game[flip ? 3 : 1] + '0';
+	buffer[5] = game[flip ? 0 : 2] + '0';
+	buffer[6] = game[flip ? 1 : 3] + '0';
+	buffer[7] = '\n';
+}
+
+static char rot_quad[] = { '3', '4', '1', '2' };
+
+
 // global variables
 struct io_uring *uring;		// used in ioreq
 static struct server *server;	// used in our callbacks
 
 // callbacks
 
+void close_socket(int rv, int socket, void *data)
+{
+	close(socket);
+}
+
+void state_push(struct room *room)
+{
+	int socket;
+	char *from_buf = room->turn
+		? room->rbuffer1
+		: room->rbuffer0;
+
+	printf("got state %s\n", from_buf + 1);
+
+	if (room->turn) {
+		room->game[0] = room->rbuffer1[5] - '0';
+		room->game[1] = room->rbuffer1[6] - '0';
+		room->game[2] = room->rbuffer1[3] - '0';
+		room->game[3] = room->rbuffer1[4] - '0';
+	} else {
+		room->game[0] = room->rbuffer0[3] - '0';
+		room->game[1] = room->rbuffer0[4] - '0';
+		room->game[2] = room->rbuffer0[5] - '0';
+		room->game[3] = room->rbuffer0[6] - '0';
+	}
+
+	printf("persisted state %i%i%i%i\n",
+		room->game[0], room->game[1],
+		room->game[2], room->game[3]);
+
+	pack_state(room->wbuffer,
+		rot_quad[(from_buf[1] - '0') - 1],
+		rot_quad[(from_buf[2] - '0') - 1],
+		room->game, !room->turn);
+	printf("sending state %s", room->wbuffer + 1);
+
+	// switch turns
+	room->turn = !room->turn;
+	socket = room->socket[room->turn];
+	ioreq_send(socket, room->wbuffer, READ_SZ, NULL, NULL);
+}
+
+void first_state_push(int rv, int socket, void *data)
+{
+	struct room *room = data;
+	room->state = ROOM_STATE_PLAYING;
+	socket = room->socket[room->turn];
+	pack_state(room->wbuffer, '0', '0', room->game, 0);
+	printf("first state: %s\n", room->wbuffer);
+	ioreq_send(socket, room->wbuffer, READ_SZ, NULL, NULL);
+}
+
+void wait_all(int rv, int socket, void *data)
+{
+	struct wait_all *wait_for = data;
+	if (--wait_for->count == 0) {
+		wait_for->callback(rv, socket, wait_for->user_data);
+		free(wait_for);
+	}
+}
+
 void start_game(int rv, int socket, void *data)
 {
-	printf("we made it!\n");
-	struct start_game_msg *msg = data;
-	free(msg->buffer);
-	server_room_free(server, msg->room->code);
+	struct room *room = data;
+	struct wait_all *wait_for = malloc(sizeof(*wait_for));
+	if (!wait_for) die("start_game(): malloc():");
+	memset(wait_for, 0, sizeof(*wait_for));
+
+	wait_for->count = 2;
+	wait_for->user_data = room;
+	wait_for->callback = first_state_push;
+
+	room->wbuffer[0] = OP_GAME_START;
+	room->wbuffer[1] = '\n';
+
+	for (int i = 0; i < 2; i++) {
+		socket = room->socket[i];
+		ioreq_send(socket, room->wbuffer, 2, wait_for, wait_all);
+	}
+}
+
+void handle_recv(int rv, int socket, void *data)
+{
+	struct room *room = data;
+	if (room->state == ROOM_STATE_BROKEN) {
+		server_room_free(server, room->code);
+		close(socket);
+		return;
+	}
+	if (rv <= 0) {
+		close(socket);
+		if (room->state == ROOM_STATE_PENDING) {
+			server_room_free(server, room->code);
+			return;
+		}
+		room->state = ROOM_STATE_BROKEN;
+		socket = room->socket[0] == socket
+			? room->socket[1]
+			: room->socket[0];
+		ioreq_send(socket, "-2\n", 3, NULL, NULL);
+		return;
+	}
+
+	char *buffer = room->socket[0] == socket 
+		? room->rbuffer0
+		: room->rbuffer1;
+
+	switch (room->state) {
+	case ROOM_STATE_PENDING:
+		// silently ignore their write
+		break;
+	case ROOM_STATE_PLAYING:
+		// silently ignore their write if it's not their turn
+		if (room->socket[room->turn] != socket) break;
+		state_push(room);
+		break;
+	}
+	ioreq_recv(socket, buffer, READ_SZ, room, handle_recv);
 }
 
 void handle_first_recv(int rv, int socket, void *data)
 {
 	if (rv == 0) {
-		fprintf(stderr, "closed!\n");
+		fprintf(stderr, "closed on first recv?!\n");
 		close(socket);
 		return;
 	}
 
 	struct room *room;
-	struct start_game_msg *msg;
-
 	char *buffer = data;
 	if (buffer[0] >= '0') buffer[0] -= '0';
 
@@ -147,7 +279,10 @@ void handle_first_recv(int rv, int socket, void *data)
 	case OP_CREATE_ROOM:
 		room = server_room_init(server);
 		room_add_conn(room, socket);
-		ioreq_send(socket, room->code, 5, NULL, NULL);
+		memcpy(room->wbuffer, room->code, 4);
+		room->wbuffer[4] = '\n';
+		ioreq_send(socket, room->wbuffer, 5, NULL, NULL);
+		ioreq_recv(socket, room->rbuffer0, READ_SZ, room, handle_recv);
 		break;
 	case OP_JOIN_ROOM:
 		buffer += 1;
@@ -155,19 +290,11 @@ void handle_first_recv(int rv, int socket, void *data)
 		room = server_get_room(server, buffer);
 		if (!room || room_add_conn(room, socket) < 0) {
 			fprintf(stderr, "bad room join: %s\n", buffer);
+			ioreq_send(socket, "-1\n", 3, NULL, close_socket);
 			break;
 		}
-		fprintf(stdout, "joining %s\n", buffer);
-
-		msg = malloc(sizeof(*msg));
-		if (!msg) die("handle_first_recv(): malloc():");
-		memset(msg, 0, sizeof(*msg));
-
-		msg->buffer = malloc(sizeof(char) * 3);
-		if (!msg->buffer) die("handle_first_recv(): malloc():");
-		memcpy(msg->buffer, "2\n", 3);
-
-		ioreq_send(socket, msg->buffer, 3, msg, start_game);
+		ioreq_send(socket, "0\n", 2, room, start_game);
+		ioreq_recv(socket, room->rbuffer1, READ_SZ, room, handle_recv);
 		break;
 	default:
 		fprintf(stderr, "bad op: %i\n", buffer[0]);
